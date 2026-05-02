@@ -1,0 +1,10 @@
+export DB_HOST="localhost"
+export DB_PORT=5432
+export DB_NAME="findgood"
+export DB_USER="postgres"
+export DB_PASSWORD="qwe123"
+export MASSIVE_API_KEY="ykd6vXNjNxUeau4aY05ATUP0vhxrADNp"
+export MASSIVE_S3_ACCESS_KEY="a3c23a48-561d-45ad-90ff-3df84c6016cc"
+export MASSIVE_S3_SECRET_KEY="ykd6vXNjNxUeau4aY05ATUP0vhxrADNp"
+export MASSIVE_S3_ENDPOINT="https://files.massive.com"
+export MASSIVE_S3_BUCKET="flatfiles"

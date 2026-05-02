@@ -1,0 +1,16 @@
+pyproject.toml
+findgood/__init__.py
+findgood/backtest.py
+findgood/cli.py
+findgood/config.py
+findgood/db.py
+findgood/downloader.py
+findgood/features.py
+findgood/ingest.py
+findgood/news.py
+findgood.egg-info/PKG-INFO
+findgood.egg-info/SOURCES.txt
+findgood.egg-info/dependency_links.txt
+findgood.egg-info/entry_points.txt
+findgood.egg-info/requires.txt
+findgood.egg-info/top_level.txt

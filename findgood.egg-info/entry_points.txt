@@ -1,0 +1,2 @@
+[console_scripts]
+findgood = findgood.cli:cli
