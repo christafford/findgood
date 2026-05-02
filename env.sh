@@ -1,5 +1,5 @@
 export DB_HOST="localhost"
-export DB_PORT=5432
+export DB_PORT=9990
 export DB_NAME="findgood"
 export DB_USER="postgres"
 export DB_PASSWORD="qwe123"

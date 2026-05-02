@@ -6,8 +6,20 @@ only prior data, pick the top 3, and measure actual intraday returns.
 
 from datetime import date
 from decimal import Decimal
+
+import numpy as np
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
+
 from findgood.db import get_connection
 from findgood.features import compute_features
+
+FEATURE_COLUMNS = [
+    "overnight_gap", "return_1d", "return_5d", "return_10d",
+    "volatility_10d", "avg_range_10d", "volume_ratio_1d",
+    "up_days_5d", "eod_return_prev",
+    "news_count_3d", "news_positive_ratio", "news_negative_ratio",
+]
 
 
 def get_trading_days(start: date, end: date) -> list[date]:
@@ -155,7 +167,45 @@ STRATEGIES = {
     "momentum_sentiment": _strategy_momentum_sentiment,
     "mean_reversion": _strategy_mean_reversion,
     "breakout": _strategy_breakout,
+    "learned": None,  # handled specially in run_backtest
 }
+
+
+def _features_to_array(features: list[dict]) -> np.ndarray:
+    """Convert feature dicts to a numpy array using FEATURE_COLUMNS."""
+    return np.array([
+        [float(f.get(col, 0)) for col in FEATURE_COLUMNS]
+        for f in features
+    ], dtype=np.float64)
+
+
+def _train_model(training_data: list[tuple[list[dict], np.ndarray]]):
+    """Train a Ridge regression on accumulated training data.
+
+    Returns (model, scaler) tuple.
+    """
+    all_X = []
+    all_y = []
+    for features, _ in training_data:
+        X = _features_to_array(features)
+        y = np.array([float(f["intraday_return"]) for f in features])
+        all_X.append(X)
+        all_y.append(y)
+
+    X = np.vstack(all_X)
+    y = np.concatenate(all_y)
+
+    # Remove any NaN/inf
+    mask = np.isfinite(X).all(axis=1) & np.isfinite(y)
+    X, y = X[mask], y[mask]
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    model = Ridge(alpha=1.0)
+    model.fit(X_scaled, y)
+
+    return model, scaler
 
 
 def run_backtest(start: date, end: date, strategy: str = "momentum_sentiment",
@@ -163,40 +213,67 @@ def run_backtest(start: date, end: date, strategy: str = "momentum_sentiment",
                  min_avg_volume: float = 100_000) -> dict:
     """Run walk-forward backtest over the date range.
 
+    For the 'learned' strategy, uses expanding-window training:
+    each day, the model is trained on all prior days' data, then
+    used to score today's stocks.
+
     Returns summary dict with daily picks, returns, and aggregate stats.
     """
     trading_days = get_trading_days(start, end)
 
-    # Need at least the second day to have prior data
     if len(trading_days) < 2:
         return {"error": "Need at least 2 trading days"}
 
     # Skip the first few days so features have enough history
-    test_days = trading_days[5:]  # start after 5 days of warmup
+    test_days = trading_days[5:]
+
+    is_learned = (strategy == "learned")
+    training_data = []  # list of (features_list,) for learned strategy
+    min_train_days = 5  # need at least this many days before predicting
 
     daily_results = []
     total_return = 0.0
     winning_days = 0
 
-    for trade_date in test_days:
+    for day_idx, trade_date in enumerate(test_days):
         features = compute_features(trade_date, min_price, min_avg_volume)
         if not features:
             continue
 
-        scored = score_stocks(features, strategy)
+        if is_learned:
+            # Add today to training buffer (for future days)
+            training_data.append((features, None))
+
+            if day_idx < min_train_days:
+                # Not enough training data yet, skip
+                continue
+
+            # Train on all prior days (not including today)
+            model, scaler = _train_model(training_data[:-1])
+
+            # Score today's stocks
+            X_today = _features_to_array(features)
+            mask = np.isfinite(X_today).all(axis=1)
+            predictions = np.full(len(features), -999.0)
+            if mask.any():
+                predictions[mask] = model.predict(scaler.transform(X_today[mask]))
+
+            for j, f in enumerate(features):
+                f["score"] = float(predictions[j])
+            scored = sorted(features, key=lambda r: r["score"], reverse=True)
+        else:
+            scored = score_stocks(features, strategy)
+
         picks = scored[:top_n]
 
-        # Average return of our picks
         day_return = sum(float(p["intraday_return"]) for p in picks) / len(picks)
         total_return += day_return
         if day_return > 0:
             winning_days += 1
 
-        # Also track what the best possible picks would have been
         best = sorted(features, key=lambda r: float(r["intraday_return"]), reverse=True)[:top_n]
         best_return = sum(float(b["intraday_return"]) for b in best) / len(best)
 
-        # And the market average
         market_return = sum(float(f["intraday_return"]) for f in features) / len(features)
 
         daily_results.append({
@@ -212,7 +289,7 @@ def run_backtest(start: date, end: date, strategy: str = "momentum_sentiment",
     if n_days == 0:
         return {"error": "No testable days"}
 
-    return {
+    result = {
         "strategy": strategy,
         "period": f"{test_days[0]} to {test_days[-1]}",
         "trading_days": n_days,
@@ -224,3 +301,14 @@ def run_backtest(start: date, end: date, strategy: str = "momentum_sentiment",
         "avg_market_return": sum(d["market_avg_return"] for d in daily_results) / n_days,
         "daily_results": daily_results,
     }
+
+    # For learned strategy, show feature importances from final model
+    if is_learned and training_data:
+        model, scaler = _train_model(training_data)
+        # Coefficients are on scaled features, so magnitude = importance
+        coefs = model.coef_
+        importance = sorted(zip(FEATURE_COLUMNS, coefs),
+                            key=lambda x: abs(x[1]), reverse=True)
+        result["feature_importance"] = importance
+
+    return result

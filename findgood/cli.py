@@ -179,6 +179,13 @@ def backtest(strategy, top_n, min_price, min_volume, days):
     alpha = result['avg_daily_return'] - result['avg_market_return']
     print(f"Daily alpha:       {alpha:+.6f} ({alpha*100:+.4f}%)")
     print(f"Win rate:          {result['win_rate']:.1%} ({result['winning_days']}W / {result['losing_days']}L)")
+
+    if "feature_importance" in result:
+        print(f"\nFeature importance (learned weights):")
+        for feat, coef in result["feature_importance"]:
+            bar = "+" * int(min(abs(coef) * 200, 30)) if coef > 0 else "-" * int(min(abs(coef) * 200, 30))
+            print(f"  {feat:<25} {coef:>+8.5f}  {bar}")
+
     print()
 
     # Daily detail

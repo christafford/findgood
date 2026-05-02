@@ -6,3 +6,5 @@ Requires-Dist: boto3>=1.35
 Requires-Dist: psycopg2-binary>=2.9
 Requires-Dist: click>=8.1
 Requires-Dist: requests>=2.31
+Requires-Dist: scikit-learn>=1.5
+Requires-Dist: numpy>=1.26

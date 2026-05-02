@@ -36,4 +36,4 @@ MASSIVE_API_BASE = "https://api.massive.com"
 def api_key() -> str:
     return _require("MASSIVE_API_KEY")
 
-LOOKBACK_DAYS = 30
+LOOKBACK_DAYS = 365
