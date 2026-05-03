@@ -37,8 +37,8 @@ def _ingest_news_day(session: requests.Session, target_date: date) -> int:
         if page == 1:
             results, next_url = _fetch_page(session, url, params)
         else:
-            # next_url already contains all params including apiKey
-            results, next_url = _fetch_page(session, next_url)
+            # next_url doesn't include apiKey, so add it
+            results, next_url = _fetch_page(session, next_url, {"apiKey": api_key()})
 
         if not results:
             break
