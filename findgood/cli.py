@@ -5,6 +5,7 @@ from findgood import db
 from findgood.ingest import ingest_data_type
 from findgood.news import fetch_news
 from findgood.backtest import run_backtest, STRATEGIES
+from findgood.features import build_eod_cache_v2
 
 
 @click.group()
@@ -127,6 +128,13 @@ def status():
 
     finally:
         conn.close()
+
+
+@cli.command("build-cache")
+def build_cache():
+    """Precompute eod_cache from minute_aggs (required before backtest)."""
+    build_eod_cache_v2()
+    print("Done.")
 
 
 @cli.command("backtest")
