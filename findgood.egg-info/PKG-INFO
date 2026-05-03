@@ -8,3 +8,4 @@ Requires-Dist: click>=8.1
 Requires-Dist: requests>=2.31
 Requires-Dist: scikit-learn>=1.5
 Requires-Dist: numpy>=1.26
+Requires-Dist: lightgbm>=4.0

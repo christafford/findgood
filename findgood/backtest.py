@@ -8,6 +8,7 @@ from datetime import date
 from decimal import Decimal
 
 import numpy as np
+import lightgbm as lgb
 from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler
 
@@ -167,7 +168,8 @@ STRATEGIES = {
     "momentum_sentiment": _strategy_momentum_sentiment,
     "mean_reversion": _strategy_mean_reversion,
     "breakout": _strategy_breakout,
-    "learned": None,  # handled specially in run_backtest
+    "learned": None,   # Ridge regression, handled specially in run_backtest
+    "lgbm": None,      # LightGBM, handled specially in run_backtest
 }
 
 
@@ -179,11 +181,8 @@ def _features_to_array(features: list[dict]) -> np.ndarray:
     ], dtype=np.float64)
 
 
-def _train_model(training_data: list[tuple[list[dict], np.ndarray]]):
-    """Train a Ridge regression on accumulated training data.
-
-    Returns (model, scaler) tuple.
-    """
+def _prepare_training_data(training_data: list[tuple]):
+    """Concatenate all training days into X, y arrays."""
     all_X = []
     all_y = []
     for features, _ in training_data:
@@ -195,17 +194,36 @@ def _train_model(training_data: list[tuple[list[dict], np.ndarray]]):
     X = np.vstack(all_X)
     y = np.concatenate(all_y)
 
-    # Remove any NaN/inf
     mask = np.isfinite(X).all(axis=1) & np.isfinite(y)
-    X, y = X[mask], y[mask]
+    return X[mask], y[mask]
 
+
+def _train_model(training_data: list[tuple]):
+    """Train a Ridge regression. Returns (model, scaler)."""
+    X, y = _prepare_training_data(training_data)
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
-
     model = Ridge(alpha=1.0)
     model.fit(X_scaled, y)
-
     return model, scaler
+
+
+def _train_lgbm(training_data: list[tuple]):
+    """Train a LightGBM regressor. Returns (model, None)."""
+    X, y = _prepare_training_data(training_data)
+    model = lgb.LGBMRegressor(
+        n_estimators=200,
+        max_depth=6,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_samples=50,
+        reg_alpha=0.1,
+        reg_lambda=0.1,
+        verbose=-1,
+    )
+    model.fit(X, y)
+    return model, None
 
 
 def run_backtest(start: date, end: date, strategy: str = "momentum_sentiment",
@@ -227,9 +245,10 @@ def run_backtest(start: date, end: date, strategy: str = "momentum_sentiment",
     # Skip the first few days so features have enough history
     test_days = trading_days[5:]
 
-    is_learned = (strategy == "learned")
-    training_data = []  # list of (features_list,) for learned strategy
-    min_train_days = 5  # need at least this many days before predicting
+    is_ml = strategy in ("learned", "lgbm")
+    train_fn = _train_lgbm if strategy == "lgbm" else _train_model
+    training_data = []
+    min_train_days = 5
 
     daily_results = []
     total_return = 0.0
@@ -240,23 +259,20 @@ def run_backtest(start: date, end: date, strategy: str = "momentum_sentiment",
         if not features:
             continue
 
-        if is_learned:
-            # Add today to training buffer (for future days)
+        if is_ml:
             training_data.append((features, None))
 
             if day_idx < min_train_days:
-                # Not enough training data yet, skip
                 continue
 
-            # Train on all prior days (not including today)
-            model, scaler = _train_model(training_data[:-1])
+            model, scaler = train_fn(training_data[:-1])
 
-            # Score today's stocks
             X_today = _features_to_array(features)
             mask = np.isfinite(X_today).all(axis=1)
             predictions = np.full(len(features), -999.0)
             if mask.any():
-                predictions[mask] = model.predict(scaler.transform(X_today[mask]))
+                X_pred = scaler.transform(X_today[mask]) if scaler else X_today[mask]
+                predictions[mask] = model.predict(X_pred)
 
             for j, f in enumerate(features):
                 f["score"] = float(predictions[j])
@@ -302,13 +318,17 @@ def run_backtest(start: date, end: date, strategy: str = "momentum_sentiment",
         "daily_results": daily_results,
     }
 
-    # For learned strategy, show feature importances from final model
-    if is_learned and training_data:
-        model, scaler = _train_model(training_data)
-        # Coefficients are on scaled features, so magnitude = importance
-        coefs = model.coef_
-        importance = sorted(zip(FEATURE_COLUMNS, coefs),
-                            key=lambda x: abs(x[1]), reverse=True)
+    # Show feature importances from final model
+    if is_ml and training_data:
+        model, scaler = train_fn(training_data)
+        if strategy == "lgbm":
+            importances = model.feature_importances_
+            importance = sorted(zip(FEATURE_COLUMNS, importances),
+                                key=lambda x: x[1], reverse=True)
+        else:
+            coefs = model.coef_
+            importance = sorted(zip(FEATURE_COLUMNS, coefs),
+                                key=lambda x: abs(x[1]), reverse=True)
         result["feature_importance"] = importance
 
     return result
