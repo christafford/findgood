@@ -207,13 +207,16 @@ def _migrate_minute_partitions(cur):
 
 
 def _create_minute_partitions(cur):
-    """Create monthly partitions covering from 13 months ago to 2 months ahead."""
+    """Create monthly partitions covering the full lookback window plus 2 months ahead."""
+    from findgood.config import LOOKBACK_DAYS
     today = date.today()
-    start = date(today.year, today.month, 1) - timedelta(days=395)
+    start = date(today.year, today.month, 1) - timedelta(days=LOOKBACK_DAYS + 30)
     start = date(start.year, start.month, 1)
 
+    # Calculate number of months to cover
+    months_needed = (LOOKBACK_DAYS // 30) + 4
     current = start
-    for _ in range(17):
+    for _ in range(months_needed):
         part_name = f"minute_aggs_{current.strftime('%Y_%m')}"
         if current.month == 12:
             next_month = date(current.year + 1, 1, 1)

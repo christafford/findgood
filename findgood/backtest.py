@@ -175,14 +175,16 @@ STRATEGIES = {
 
 def _features_to_array(features: list[dict]) -> np.ndarray:
     """Convert feature dicts to a numpy array using FEATURE_COLUMNS."""
-    return np.array([
-        [float(f.get(col, 0)) for col in FEATURE_COLUMNS]
+    import pandas as pd
+    return pd.DataFrame([
+        {col: float(f.get(col, 0)) for col in FEATURE_COLUMNS}
         for f in features
-    ], dtype=np.float64)
+    ])
 
 
 def _prepare_training_data(training_data: list[tuple]):
     """Concatenate all training days into X, y arrays."""
+    import pandas as pd
     all_X = []
     all_y = []
     for features, _ in training_data:
@@ -191,10 +193,10 @@ def _prepare_training_data(training_data: list[tuple]):
         all_X.append(X)
         all_y.append(y)
 
-    X = np.vstack(all_X)
+    X = pd.concat(all_X, ignore_index=True)
     y = np.concatenate(all_y)
 
-    mask = np.isfinite(X).all(axis=1) & np.isfinite(y)
+    mask = X.notna().all(axis=1) & np.isfinite(X.values).all(axis=1) & np.isfinite(y)
     return X[mask], y[mask]
 
 
@@ -212,14 +214,15 @@ def _train_lgbm(training_data: list[tuple]):
     """Train a LightGBM regressor. Returns (model, None)."""
     X, y = _prepare_training_data(training_data)
     model = lgb.LGBMRegressor(
-        n_estimators=200,
-        max_depth=6,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        min_child_samples=50,
-        reg_alpha=0.1,
-        reg_lambda=0.1,
+        n_estimators=100,
+        max_depth=3,
+        num_leaves=8,
+        learning_rate=0.03,
+        subsample=0.7,
+        colsample_bytree=0.7,
+        min_child_samples=200,
+        reg_alpha=1.0,
+        reg_lambda=1.0,
         verbose=-1,
     )
     model.fit(X, y)
@@ -268,11 +271,11 @@ def run_backtest(start: date, end: date, strategy: str = "momentum_sentiment",
             model, scaler = train_fn(training_data[:-1])
 
             X_today = _features_to_array(features)
-            mask = np.isfinite(X_today).all(axis=1)
+            mask = X_today.notna().all(axis=1) & np.isfinite(X_today.values).all(axis=1)
             predictions = np.full(len(features), -999.0)
             if mask.any():
                 X_pred = scaler.transform(X_today[mask]) if scaler else X_today[mask]
-                predictions[mask] = model.predict(X_pred)
+                predictions[mask.values] = model.predict(X_pred)
 
             for j, f in enumerate(features):
                 f["score"] = float(predictions[j])
