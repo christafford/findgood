@@ -231,9 +231,12 @@ def compare(min_price, min_volume):
 
     results = {}
     for name in STRATEGIES:
+        print(f"  Running {name}...", flush=True)
         result = run_backtest(earliest, latest, name, 3, min_price, min_volume)
         if "error" not in result:
             results[name] = result
+            alpha = result['avg_daily_return'] - result['avg_market_return']
+            print(f"    done: alpha={alpha*100:+.4f}%, win={result['win_rate']:.1%}", flush=True)
 
     print(f"{'Strategy':<25} {'Total':>9} {'Avg Daily':>11} {'Market':>11} {'Alpha':>11} {'Win%':>7}")
     print("-" * 78)

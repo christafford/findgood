@@ -252,6 +252,10 @@ def run_backtest(start: date, end: date, strategy: str = "momentum_sentiment",
     train_fn = _train_lgbm if strategy == "lgbm" else _train_model
     training_data = []
     min_train_days = 5
+    retrain_every = 5  # retrain model every N trading days
+    cached_model = None
+    cached_scaler = None
+    days_since_train = 0
 
     daily_results = []
     total_return = 0.0
@@ -268,7 +272,12 @@ def run_backtest(start: date, end: date, strategy: str = "momentum_sentiment",
             if day_idx < min_train_days:
                 continue
 
-            model, scaler = train_fn(training_data[:-1])
+            # Only retrain every N days (or on first run)
+            if cached_model is None or days_since_train >= retrain_every:
+                cached_model, cached_scaler = train_fn(training_data[:-1])
+                days_since_train = 0
+            days_since_train += 1
+            model, scaler = cached_model, cached_scaler
 
             X_today = _features_to_array(features)
             mask = X_today.notna().all(axis=1) & np.isfinite(X_today.values).all(axis=1)
