@@ -64,6 +64,24 @@ CREATE TABLE IF NOT EXISTS news_fetch_log (
     fetched_at   timestamptz NOT NULL DEFAULT now()
 );
 
+-- Ticker sector/industry classification
+CREATE TABLE IF NOT EXISTS ticker_details (
+    ticker_id    integer PRIMARY KEY REFERENCES tickers(id),
+    sic_code     text,
+    sector       text,
+    industry     text,
+    market_cap   bigint,
+    fetched_at   timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_ticker_details_sector ON ticker_details (sector);
+CREATE INDEX IF NOT EXISTS idx_ticker_details_sic ON ticker_details (sic_code);
+
+-- Sector ETF mapping (manually defined, major SPDR sector ETFs)
+CREATE TABLE IF NOT EXISTS sector_etfs (
+    sector       text PRIMARY KEY,
+    etf_symbol   text NOT NULL
+);
+
 -- Minute OHLCV aggregates (partitioned by month)
 CREATE TABLE IF NOT EXISTS minute_aggs (
     ticker_id    integer NOT NULL,

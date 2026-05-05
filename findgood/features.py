@@ -182,6 +182,7 @@ def compute_features(trade_date: date, min_price: float = 1.0,
 
 
 # Feature query uses precomputed eod_cache instead of scanning minute_aggs.
+# Includes sector/index correlation features.
 FEATURE_QUERY = """
 WITH today AS (
     SELECT d.ticker_id, t.symbol,
@@ -223,10 +224,85 @@ prior_stats AS (
         AVG(CASE WHEN p.days_ago <= 5 THEN p.volume END) AS avg_volume_5d,
         SUM(CASE WHEN p.days_ago <= 5 AND p.close > p.open THEN 1 ELSE 0 END) AS up_days_5d,
         COUNT(*) FILTER (WHERE p.days_ago <= 10) AS trading_days_10d,
-        -- Previous trading date for eod_cache lookup
         MAX(CASE WHEN p.days_ago = 1 THEN p.trade_date END) AS prev_trade_date
     FROM prior p
     GROUP BY p.ticker_id
+),
+
+-- SPY returns for the same prior window (market proxy)
+spy_prior AS (
+    SELECT d.trade_date,
+           CASE WHEN d.open > 0 THEN (d.close - d.open) / d.open ELSE 0 END AS spy_return
+    FROM day_aggs d
+    JOIN tickers t ON d.ticker_id = t.id
+    WHERE t.symbol = 'SPY'
+      AND d.trade_date < %(trade_date)s
+      AND d.trade_date >= %(trade_date)s - 30
+),
+
+-- Stock vs SPY correlation over prior 10 days
+stock_spy_corr AS (
+    SELECT
+        p.ticker_id,
+        CORR(
+            CASE WHEN p.open > 0 THEN (p.close - p.open) / p.open ELSE 0 END,
+            sp.spy_return
+        ) AS spy_correlation_10d,
+        -- Relative strength: stock 5d return minus SPY 5d return
+        -- (computed via aggregation)
+        REGR_SLOPE(
+            CASE WHEN p.open > 0 THEN (p.close - p.open) / p.open ELSE 0 END,
+            sp.spy_return
+        ) AS beta_spy_10d
+    FROM prior p
+    JOIN spy_prior sp ON p.trade_date = sp.trade_date
+    WHERE p.days_ago <= 10
+    GROUP BY p.ticker_id
+    HAVING COUNT(*) >= 5
+),
+
+-- Sector ETF returns for prior window
+sector_etf_prior AS (
+    SELECT se.sector, d.trade_date,
+           CASE WHEN d.open > 0 THEN (d.close - d.open) / d.open ELSE 0 END AS etf_return
+    FROM sector_etfs se
+    JOIN tickers t ON t.symbol = se.etf_symbol
+    JOIN day_aggs d ON d.ticker_id = t.id
+    WHERE d.trade_date < %(trade_date)s
+      AND d.trade_date >= %(trade_date)s - 30
+),
+
+-- Stock vs its sector ETF correlation
+stock_sector_corr AS (
+    SELECT
+        p.ticker_id,
+        td.sector,
+        CORR(
+            CASE WHEN p.open > 0 THEN (p.close - p.open) / p.open ELSE 0 END,
+            sep.etf_return
+        ) AS sector_correlation_10d,
+        -- Relative strength vs sector
+        AVG(CASE WHEN p.days_ago <= 5 AND p.open > 0
+            THEN (p.close - p.open) / p.open END)
+        - AVG(CASE WHEN p.days_ago <= 5 THEN sep.etf_return END)
+        AS relative_strength_vs_sector_5d
+    FROM prior p
+    JOIN ticker_details td ON p.ticker_id = td.ticker_id
+    JOIN sector_etf_prior sep ON td.sector = sep.sector AND p.trade_date = sep.trade_date
+    WHERE p.days_ago <= 10
+    GROUP BY p.ticker_id, td.sector
+    HAVING COUNT(*) >= 5
+),
+
+-- SPY's return yesterday (market direction)
+spy_yesterday AS (
+    SELECT
+        CASE WHEN d.open > 0 THEN (d.close - d.open) / d.open ELSE 0 END AS spy_return_1d,
+        CASE WHEN d.open > 0 THEN (d.high - d.low) / d.close ELSE 0 END AS spy_range_1d
+    FROM day_aggs d
+    JOIN tickers t ON d.ticker_id = t.id
+    WHERE t.symbol = 'SPY'
+      AND d.trade_date = (SELECT MAX(trade_date) FROM day_aggs WHERE trade_date < %(trade_date)s)
 ),
 
 news_stats AS (
@@ -279,13 +355,24 @@ SELECT
          ELSE 0 END AS news_positive_ratio,
     CASE WHEN COALESCE(nw.news_count_3d, 0) > 0
          THEN nw.news_negative_3d::float / nw.news_count_3d
-         ELSE 0 END AS news_negative_ratio
+         ELSE 0 END AS news_negative_ratio,
+
+    -- Sector/index correlation features
+    COALESCE(ssc.spy_correlation_10d, 0) AS spy_correlation_10d,
+    COALESCE(ssc.beta_spy_10d, 1) AS beta_spy_10d,
+    COALESCE(scc.sector_correlation_10d, 0) AS sector_correlation_10d,
+    COALESCE(scc.relative_strength_vs_sector_5d, 0) AS relative_strength_vs_sector_5d,
+    COALESCE(sy.spy_return_1d, 0) AS spy_return_1d,
+    COALESCE(sy.spy_range_1d, 0) AS spy_range_1d
 
 FROM today
 JOIN prior_stats ps ON today.ticker_id = ps.ticker_id
 LEFT JOIN eod_cache eod ON eod.ticker_id = today.ticker_id
                        AND eod.trade_date = ps.prev_trade_date
 LEFT JOIN news_stats nw ON today.ticker_id = nw.ticker_id
+LEFT JOIN stock_spy_corr ssc ON today.ticker_id = ssc.ticker_id
+LEFT JOIN stock_sector_corr scc ON today.ticker_id = scc.ticker_id
+LEFT JOIN spy_yesterday sy ON true
 
 WHERE today.open >= %(min_price)s
   AND COALESCE(ps.avg_volume_10d, 0) >= %(min_avg_volume)s

@@ -6,6 +6,7 @@ from findgood.ingest import ingest_data_type
 from findgood.news import fetch_news
 from findgood.backtest import run_backtest, STRATEGIES
 from findgood.features import build_eod_cache_v2
+from findgood.sectors import fetch_ticker_details, init_sector_etfs
 
 
 @click.group()
@@ -135,6 +136,13 @@ def build_cache():
     """Precompute eod_cache from minute_aggs (required before backtest)."""
     build_eod_cache_v2()
     print("Done.")
+
+
+@cli.command("fetch-sectors")
+def fetch_sectors():
+    """Fetch sector/industry classification for all tickers."""
+    init_sector_etfs()
+    fetch_ticker_details()
 
 
 @cli.command("backtest")

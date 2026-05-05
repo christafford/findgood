@@ -20,6 +20,9 @@ FEATURE_COLUMNS = [
     "volatility_10d", "avg_range_10d", "volume_ratio_1d",
     "up_days_5d", "eod_return_prev",
     "news_count_3d", "news_positive_ratio", "news_negative_ratio",
+    "spy_correlation_10d", "beta_spy_10d",
+    "sector_correlation_10d", "relative_strength_vs_sector_5d",
+    "spy_return_1d", "spy_range_1d",
 ]
 
 
