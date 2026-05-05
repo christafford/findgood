@@ -148,7 +148,7 @@ def fetch_sectors():
 @cli.command("backtest")
 @click.option("--strategy", "-s",
               type=click.Choice(list(STRATEGIES.keys()), case_sensitive=False),
-              default="momentum_sentiment",
+              default="lgbm",
               help="Scoring strategy to test.")
 @click.option("--top-n", "-n", default=3, help="Number of stocks to pick per day.")
 @click.option("--min-price", default=1.0, help="Minimum stock price filter.")

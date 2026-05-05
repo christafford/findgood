@@ -8,6 +8,7 @@ from datetime import date
 from decimal import Decimal
 
 import numpy as np
+import pandas as pd
 import lightgbm as lgb
 from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler
@@ -15,7 +16,8 @@ from sklearn.preprocessing import StandardScaler
 from findgood.db import get_connection
 from findgood.features import compute_features
 
-FEATURE_COLUMNS = [
+# Base features from the SQL query
+BASE_FEATURES = [
     "overnight_gap", "return_1d", "return_5d", "return_10d",
     "volatility_10d", "avg_range_10d", "volume_ratio_1d",
     "up_days_5d", "eod_return_prev",
@@ -24,6 +26,20 @@ FEATURE_COLUMNS = [
     "sector_correlation_10d", "relative_strength_vs_sector_5d",
     "spy_return_1d", "spy_range_1d",
 ]
+
+# Interaction features computed from base features
+INTERACTION_FEATURES = [
+    "return_1d_x_spy_return",        # stock momentum relative to market
+    "overnight_gap_x_beta",          # gap adjusted for beta
+    "volatility_x_spy_range",        # stock vol in context of market vol
+    "rel_strength_x_spy_return",     # sector outperformer when market moves
+    "return_1d_x_sector_corr",       # momentum weighted by sector coupling
+    "overnight_gap_x_volume_ratio",  # gap with volume confirmation
+    "beta_x_spy_return",             # expected move based on beta * market
+    "return_1d_minus_beta_x_spy",    # idiosyncratic return (alpha component)
+]
+
+FEATURE_COLUMNS = BASE_FEATURES + INTERACTION_FEATURES
 
 
 def get_trading_days(start: date, end: date) -> list[date]:
@@ -41,158 +57,36 @@ def get_trading_days(start: date, end: date) -> list[date]:
         conn.close()
 
 
-def score_stocks(features: list[dict], strategy: str = "momentum_sentiment") -> list[dict]:
-    """Score each stock using the named strategy. Returns features sorted by score desc."""
-    score_fn = STRATEGIES.get(strategy)
-    if not score_fn:
-        raise ValueError(f"Unknown strategy: {strategy}. Available: {list(STRATEGIES.keys())}")
-
-    for row in features:
-        row["score"] = score_fn(row)
-
-    return sorted(features, key=lambda r: r["score"], reverse=True)
-
-
-# --- Scoring strategies ---
-# Each takes a feature dict and returns a float score. Higher = more likely to buy.
-
-def _strategy_momentum_sentiment(f: dict) -> float:
-    """Combine short-term momentum with news sentiment and volatility."""
-    score = 0.0
-
-    # Short-term momentum: prefer stocks with recent positive returns
-    score += float(f.get("return_1d", 0)) * 2.0
-    score += float(f.get("return_5d", 0)) * 1.0
-
-    # Overnight gap: small negative gaps can mean mean-reversion opportunity
-    gap = float(f.get("overnight_gap", 0))
-    if -0.03 < gap < 0.0:
-        score += 0.5  # small gap down = potential bounce
-    elif gap > 0.05:
-        score -= 0.5  # large gap up = may fade
-
-    # News sentiment: positive news = catalyst
-    pos_ratio = float(f.get("news_positive_ratio", 0))
-    neg_ratio = float(f.get("news_negative_ratio", 0))
-    news_count = int(f.get("news_count_3d", 0))
-    if news_count > 0:
-        score += (pos_ratio - neg_ratio) * 1.5
-
-    # Volatility: prefer moderate volatility (opportunity without chaos)
-    vol = float(f.get("volatility_10d", 0))
-    if 0.01 < vol < 0.05:
-        score += 0.3
-    elif vol > 0.08:
-        score -= 0.3
-
-    # Volume surge: above-average volume yesterday = attention
-    vol_ratio = float(f.get("volume_ratio_1d", 0))
-    if vol_ratio > 1.5:
-        score += 0.4
-
-    # EOD pattern: strong close yesterday = continuation signal
-    score += float(f.get("eod_return_prev", 0)) * 3.0
-
-    return score
+def _add_interactions(df: pd.DataFrame) -> pd.DataFrame:
+    """Add interaction features to a DataFrame of base features."""
+    df["return_1d_x_spy_return"] = df["return_1d"] * df["spy_return_1d"]
+    df["overnight_gap_x_beta"] = df["overnight_gap"] * df["beta_spy_10d"]
+    df["volatility_x_spy_range"] = df["volatility_10d"] * df["spy_range_1d"]
+    df["rel_strength_x_spy_return"] = df["relative_strength_vs_sector_5d"] * df["spy_return_1d"]
+    df["return_1d_x_sector_corr"] = df["return_1d"] * df["sector_correlation_10d"]
+    df["overnight_gap_x_volume_ratio"] = df["overnight_gap"] * df["volume_ratio_1d"]
+    df["beta_x_spy_return"] = df["beta_spy_10d"] * df["spy_return_1d"]
+    df["return_1d_minus_beta_x_spy"] = df["return_1d"] - df["beta_spy_10d"] * df["spy_return_1d"]
+    return df
 
 
-def _strategy_mean_reversion(f: dict) -> float:
-    """Bet on stocks that dropped recently and may bounce."""
-    score = 0.0
-
-    # Prefer recent losers
-    score -= float(f.get("return_1d", 0)) * 3.0
-    score -= float(f.get("return_5d", 0)) * 1.5
-
-    # But only if they have positive news (catalyst for recovery)
-    pos_ratio = float(f.get("news_positive_ratio", 0))
-    news_count = int(f.get("news_count_3d", 0))
-    if news_count > 0:
-        score += pos_ratio * 2.0
-
-    # Negative gap = bounce potential
-    gap = float(f.get("overnight_gap", 0))
-    if gap < 0:
-        score += abs(gap) * 5.0
-
-    # Need volatility for a bounce
-    vol = float(f.get("volatility_10d", 0))
-    score += vol * 3.0
-
-    # High volume = attention needed for bounce
-    vol_ratio = float(f.get("volume_ratio_1d", 0))
-    if vol_ratio > 1.5:
-        score += 0.5
-
-    return score
-
-
-def _strategy_breakout(f: dict) -> float:
-    """Look for stocks about to break out: volume surge + momentum + news."""
-    score = 0.0
-
-    # Strong recent momentum
-    r1 = float(f.get("return_1d", 0))
-    r5 = float(f.get("return_5d", 0))
-    if r1 > 0 and r5 > 0:
-        score += r1 * 3.0 + r5 * 1.0
-
-    # Volume surge is key signal
-    vol_ratio = float(f.get("volume_ratio_1d", 0))
-    if vol_ratio > 2.0:
-        score += 1.0
-    elif vol_ratio > 1.5:
-        score += 0.5
-
-    # Positive gap up = continuation
-    gap = float(f.get("overnight_gap", 0))
-    if 0 < gap < 0.03:
-        score += 0.5
-
-    # News catalyst
-    news_count = int(f.get("news_count_3d", 0))
-    pos_ratio = float(f.get("news_positive_ratio", 0))
-    if news_count > 0 and pos_ratio > 0.6:
-        score += 1.0
-
-    # Strong EOD yesterday
-    eod = float(f.get("eod_return_prev", 0))
-    if eod > 0:
-        score += eod * 5.0
-
-    # Higher volatility = bigger breakout potential
-    vol = float(f.get("volatility_10d", 0))
-    score += vol * 2.0
-
-    return score
-
-
-STRATEGIES = {
-    "momentum_sentiment": _strategy_momentum_sentiment,
-    "mean_reversion": _strategy_mean_reversion,
-    "breakout": _strategy_breakout,
-    "learned": None,   # Ridge regression, handled specially in run_backtest
-    "lgbm": None,      # LightGBM, handled specially in run_backtest
-}
-
-
-def _features_to_array(features: list[dict]) -> np.ndarray:
-    """Convert feature dicts to a numpy array using FEATURE_COLUMNS."""
-    import pandas as pd
-    return pd.DataFrame([
-        {col: float(f.get(col, 0)) for col in FEATURE_COLUMNS}
+def _features_to_df(features: list[dict]) -> pd.DataFrame:
+    """Convert feature dicts to a DataFrame with base + interaction features."""
+    df = pd.DataFrame([
+        {col: float(f.get(col, 0)) for col in BASE_FEATURES}
         for f in features
     ])
+    df = _add_interactions(df)
+    return df
 
 
-def _prepare_training_data(training_data: list[tuple]):
+def _prepare_training_data(training_data: list[tuple], target_key: str = "intraday_return"):
     """Concatenate all training days into X, y arrays."""
-    import pandas as pd
     all_X = []
     all_y = []
     for features, _ in training_data:
-        X = _features_to_array(features)
-        y = np.array([float(f["intraday_return"]) for f in features])
+        X = _features_to_df(features)
+        y = np.array([float(f[target_key]) for f in features])
         all_X.append(X)
         all_y.append(y)
 
@@ -203,9 +97,9 @@ def _prepare_training_data(training_data: list[tuple]):
     return X[mask], y[mask]
 
 
-def _train_model(training_data: list[tuple]):
+def _train_ridge(training_data: list[tuple], target_key: str = "intraday_return"):
     """Train a Ridge regression. Returns (model, scaler)."""
-    X, y = _prepare_training_data(training_data)
+    X, y = _prepare_training_data(training_data, target_key)
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     model = Ridge(alpha=1.0)
@@ -213,9 +107,9 @@ def _train_model(training_data: list[tuple]):
     return model, scaler
 
 
-def _train_lgbm(training_data: list[tuple]):
+def _train_lgbm(training_data: list[tuple], target_key: str = "intraday_return"):
     """Train a LightGBM regressor. Returns (model, None)."""
-    X, y = _prepare_training_data(training_data)
+    X, y = _prepare_training_data(training_data, target_key)
     model = lgb.LGBMRegressor(
         n_estimators=100,
         max_depth=3,
@@ -232,14 +126,26 @@ def _train_lgbm(training_data: list[tuple]):
     return model, None
 
 
-def run_backtest(start: date, end: date, strategy: str = "momentum_sentiment",
+# Strategy registry — only ML strategies now
+STRATEGIES = {
+    "ridge": "ridge",
+    "lgbm": "lgbm",
+    "ridge_alpha": "ridge",    # predict alpha (return - beta*spy) instead of raw return
+    "lgbm_alpha": "lgbm",
+    "lgbm_sector_rotation": "lgbm",  # sector rotation: pick stocks outperforming sector while sector lags
+}
+
+
+def run_backtest(start: date, end: date, strategy: str = "lgbm",
                  top_n: int = 3, min_price: float = 1.0,
                  min_avg_volume: float = 100_000) -> dict:
     """Run walk-forward backtest over the date range.
 
-    For the 'learned' strategy, uses expanding-window training:
-    each day, the model is trained on all prior days' data, then
-    used to score today's stocks.
+    Strategies:
+      ridge / lgbm: predict raw intraday return
+      ridge_alpha / lgbm_alpha: predict market-adjusted return
+      lgbm_sector_rotation: predict return, but pre-filter to stocks
+        outperforming their sector when sector lags the market
 
     Returns summary dict with daily picks, returns, and aggregate stats.
     """
@@ -248,14 +154,21 @@ def run_backtest(start: date, end: date, strategy: str = "momentum_sentiment",
     if len(trading_days) < 2:
         return {"error": "Need at least 2 trading days"}
 
-    # Skip the first few days so features have enough history
     test_days = trading_days[5:]
 
-    is_ml = strategy in ("learned", "lgbm")
-    train_fn = _train_lgbm if strategy == "lgbm" else _train_model
+    # Determine model type and target
+    model_type = STRATEGIES.get(strategy)
+    if not model_type:
+        return {"error": f"Unknown strategy: {strategy}"}
+
+    is_alpha = strategy.endswith("_alpha")
+    is_sector_rotation = strategy == "lgbm_sector_rotation"
+    train_fn = _train_lgbm if model_type == "lgbm" else _train_ridge
+    target_key = "alpha_return" if is_alpha else "intraday_return"
+
     training_data = []
     min_train_days = 5
-    retrain_every = 5  # retrain model every N trading days
+    retrain_every = 5
     cached_model = None
     cached_scaler = None
     days_since_train = 0
@@ -269,31 +182,50 @@ def run_backtest(start: date, end: date, strategy: str = "momentum_sentiment",
         if not features:
             continue
 
-        if is_ml:
-            training_data.append((features, None))
+        # Compute alpha return for each stock: return - beta * spy_return
+        # This is the "today" alpha — only known after the fact (for training)
+        spy_ret_today = float(features[0].get("spy_return_1d", 0))  # yesterday's spy
+        for f in features:
+            beta = float(f.get("beta_spy_10d", 1))
+            f["alpha_return"] = float(f["intraday_return"]) - beta * float(f.get("spy_return_1d", 0))
 
-            if day_idx < min_train_days:
-                continue
+        training_data.append((features, None))
 
-            # Only retrain every N days (or on first run)
-            if cached_model is None or days_since_train >= retrain_every:
-                cached_model, cached_scaler = train_fn(training_data[:-1])
-                days_since_train = 0
-            days_since_train += 1
-            model, scaler = cached_model, cached_scaler
+        if day_idx < min_train_days:
+            continue
 
-            X_today = _features_to_array(features)
-            mask = X_today.notna().all(axis=1) & np.isfinite(X_today.values).all(axis=1)
-            predictions = np.full(len(features), -999.0)
-            if mask.any():
-                X_pred = scaler.transform(X_today[mask]) if scaler else X_today[mask]
-                predictions[mask.values] = model.predict(X_pred)
+        # Retrain periodically
+        if cached_model is None or days_since_train >= retrain_every:
+            cached_model, cached_scaler = train_fn(training_data[:-1], target_key)
+            days_since_train = 0
+        days_since_train += 1
+        model, scaler = cached_model, cached_scaler
 
-            for j, f in enumerate(features):
-                f["score"] = float(predictions[j])
-            scored = sorted(features, key=lambda r: r["score"], reverse=True)
+        # Score all stocks
+        X_today = _features_to_df(features)
+        mask = X_today.notna().all(axis=1) & np.isfinite(X_today.values).all(axis=1)
+        predictions = np.full(len(features), -999.0)
+        if mask.any():
+            X_pred = scaler.transform(X_today[mask]) if scaler else X_today[mask]
+            predictions[mask.values] = model.predict(X_pred)
+
+        for j, f in enumerate(features):
+            f["score"] = float(predictions[j])
+
+        # Sector rotation pre-filter: only consider stocks that are
+        # outperforming their sector (positive relative strength)
+        # when their sector is lagging the market (sector ETF < SPY)
+        if is_sector_rotation:
+            candidates = [
+                f for f in features
+                if float(f.get("relative_strength_vs_sector_5d", 0)) > 0
+                and f["score"] > -999.0
+            ]
+            if len(candidates) < top_n:
+                candidates = [f for f in features if f["score"] > -999.0]
+            scored = sorted(candidates, key=lambda r: r["score"], reverse=True)
         else:
-            scored = score_stocks(features, strategy)
+            scored = sorted(features, key=lambda r: r["score"], reverse=True)
 
         picks = scored[:top_n]
 
@@ -333,10 +265,10 @@ def run_backtest(start: date, end: date, strategy: str = "momentum_sentiment",
         "daily_results": daily_results,
     }
 
-    # Show feature importances from final model
-    if is_ml and training_data:
-        model, scaler = train_fn(training_data)
-        if strategy == "lgbm":
+    # Feature importances from final model
+    if training_data:
+        model, scaler = train_fn(training_data, target_key)
+        if model_type == "lgbm":
             importances = model.feature_importances_
             importance = sorted(zip(FEATURE_COLUMNS, importances),
                                 key=lambda x: x[1], reverse=True)
