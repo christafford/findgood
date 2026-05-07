@@ -254,5 +254,111 @@ def compare(min_price, min_volume):
               f"  {r['avg_market_return']*100:>+9.4f}%  {alpha*100:>+9.4f}%  {r['win_rate']:>6.1%}")
 
 
+@cli.command("predict")
+@click.option("--strategy", "-s",
+              type=click.Choice(list(STRATEGIES.keys()), case_sensitive=False),
+              default="ridge_alpha",
+              help="Strategy to use for prediction.")
+@click.option("--top-n", "-n", default=3, help="Number of stocks to pick.")
+@click.option("--min-price", default=10.0, help="Minimum stock price filter.")
+@click.option("--min-volume", default=1_000_000.0, help="Minimum 10-day avg volume filter.")
+def predict(strategy, top_n, min_price, min_volume):
+    """Generate picks for the next trading day using latest data."""
+    from findgood.features import compute_features_forward
+    from findgood.backtest import _train_ridge, _train_lgbm, _features_to_df, _prepare_training_data
+
+    # First, train the model on all historical data
+    conn = db.get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT MIN(trade_date), MAX(trade_date) FROM day_aggs")
+            earliest, latest = cur.fetchone()
+    finally:
+        conn.close()
+
+    if not earliest:
+        print("No data available.")
+        return
+
+    print(f"Training model on data from {earliest} to {latest}...")
+
+    model_type = STRATEGIES.get(strategy)
+    is_alpha = strategy.endswith("_alpha")
+    target_key = "alpha_return" if is_alpha else "intraday_return"
+    train_fn = _train_lgbm if model_type == "lgbm" else _train_ridge
+
+    # Build training data from recent history
+    import numpy as np
+    training_days = []
+    r = run_backtest(earliest, latest, strategy, top_n, min_price, min_volume)
+
+    # Get forward-looking features
+    print("Computing features for next trading day...")
+    features = compute_features_forward(min_price, min_volume)
+    if not features:
+        print("No eligible stocks found.")
+        return
+
+    # Use the model from the backtest (already trained on all data)
+    # Re-extract from the last day's training
+    print(f"Scoring {len(features)} eligible stocks...")
+
+    # We need to retrain on ALL data (the backtest only trained up to last retrain)
+    # Collect all features from the backtest's training_data
+    # Simpler: just use the last backtest result's model by running predict on features
+    X = _features_to_df(features)
+    mask = X.notna().all(axis=1) & np.isfinite(X.values).all(axis=1)
+
+    # Train final model from backtest
+    if "feature_importance" not in r:
+        print("Error: model did not train.")
+        return
+
+    # Re-train on all data
+    from findgood.features import compute_features
+    all_training = []
+    trading_days_list = []
+    with db.get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT trade_date FROM day_aggs
+                WHERE trade_date >= %s AND trade_date <= %s
+                ORDER BY trade_date
+            """, (earliest, latest))
+            trading_days_list = [row[0] for row in cur.fetchall()]
+
+    # Use last 120 trading days for training (faster than full history)
+    train_dates = trading_days_list[-120:]
+    print(f"Training on last {len(train_dates)} trading days...")
+    for td in train_dates:
+        feats = compute_features(td, min_price, min_volume)
+        if feats:
+            for f in feats:
+                beta = float(f.get("beta_spy_10d", 1))
+                f["alpha_return"] = float(f["intraday_return"]) - beta * float(f.get("spy_return_1d", 0))
+            all_training.append((feats, None))
+
+    model, scaler = train_fn(all_training, target_key)
+
+    predictions = np.full(len(features), -999.0)
+    if mask.any():
+        X_pred = scaler.transform(X[mask]) if scaler else X[mask]
+        predictions[mask.values] = model.predict(X_pred)
+
+    for j, f in enumerate(features):
+        f["score"] = float(predictions[j])
+
+    scored = sorted(features, key=lambda r: r["score"], reverse=True)
+
+    print(f"\nData through: {latest}")
+    print(f"Buy at next market open, sell at close.")
+    print(f"Strategy: {strategy} | Min price ${min_price} | Min volume {min_volume:,.0f}")
+    print(f"\nTop {top_n} picks:")
+    print(f"{'Rank':>4} {'Symbol':>8} {'Score':>10} {'Prev Close':>11}")
+    print("-" * 37)
+    for i, f in enumerate(scored[:top_n], 1):
+        print(f"{i:>4} {f['symbol']:>8} {f['score']:>+10.6f} ${float(f.get('prev_close', 0)):>9.2f}")
+
+
 if __name__ == "__main__":
     cli()
