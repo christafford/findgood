@@ -262,17 +262,47 @@ def compare(min_price, min_volume):
 @click.option("--top-n", "-n", default=3, help="Number of stocks to pick.")
 @click.option("--min-price", default=10.0, help="Minimum stock price filter.")
 @click.option("--min-volume", default=1_000_000.0, help="Minimum 10-day avg volume filter.")
-def predict(strategy, top_n, min_price, min_volume):
-    """Generate picks for the next trading day using latest data."""
-    from findgood.features import compute_features_forward
-    from findgood.backtest import _train_ridge, _train_lgbm, _features_to_df, _prepare_training_data
+@click.option("--skip-download", is_flag=True, help="Skip downloading new data.")
+def predict(strategy, top_n, min_price, min_volume, skip_download):
+    """Download latest data and generate picks for next trading day.
 
-    # First, train the model on all historical data
+    Run this each morning before market open. It will:
+    1. Download any new day_aggs and news data
+    2. Update the eod_cache
+    3. Train the model on recent data
+    4. Output top picks for today
+    """
+    import numpy as np
+    from findgood.features import compute_features, compute_features_forward
+    from findgood.backtest import _train_ridge, _train_lgbm, _features_to_df
+    from findgood.sectors import fetch_ticker_details, init_sector_etfs
+
+    # Step 1: Download latest data
+    if not skip_download:
+        print("Step 1: Downloading latest data...", flush=True)
+        ingest_data_type("day_aggs", "day_aggs_v1")
+        fetch_news()
+        # Fetch sector info for any new tickers
+        init_sector_etfs()
+        fetch_ticker_details()
+        print()
+
+    # Step 2: Update eod_cache
+    print("Step 2: Updating eod_cache...", flush=True)
+    build_eod_cache_v2()
+    print()
+
+    # Step 3: Get date range
     conn = db.get_connection()
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT MIN(trade_date), MAX(trade_date) FROM day_aggs")
             earliest, latest = cur.fetchone()
+            cur.execute("""
+                SELECT DISTINCT trade_date FROM day_aggs
+                ORDER BY trade_date DESC LIMIT 120
+            """)
+            train_dates = sorted([row[0] for row in cur.fetchall()])
     finally:
         conn.close()
 
@@ -280,57 +310,19 @@ def predict(strategy, top_n, min_price, min_volume):
         print("No data available.")
         return
 
-    print(f"Training model on data from {earliest} to {latest}...")
-
+    # Step 3: Train model on last 120 trading days
     model_type = STRATEGIES.get(strategy)
     is_alpha = strategy.endswith("_alpha")
     target_key = "alpha_return" if is_alpha else "intraday_return"
     train_fn = _train_lgbm if model_type == "lgbm" else _train_ridge
 
-    # Build training data from recent history
-    import numpy as np
-    training_days = []
-    r = run_backtest(earliest, latest, strategy, top_n, min_price, min_volume)
+    print(f"Step 3: Training {strategy} on {len(train_dates)} trading days "
+          f"({train_dates[0]} to {train_dates[-1]})...", flush=True)
 
-    # Get forward-looking features
-    print("Computing features for next trading day...")
-    features = compute_features_forward(min_price, min_volume)
-    if not features:
-        print("No eligible stocks found.")
-        return
-
-    # Use the model from the backtest (already trained on all data)
-    # Re-extract from the last day's training
-    print(f"Scoring {len(features)} eligible stocks...")
-
-    # We need to retrain on ALL data (the backtest only trained up to last retrain)
-    # Collect all features from the backtest's training_data
-    # Simpler: just use the last backtest result's model by running predict on features
-    X = _features_to_df(features)
-    mask = X.notna().all(axis=1) & np.isfinite(X.values).all(axis=1)
-
-    # Train final model from backtest
-    if "feature_importance" not in r:
-        print("Error: model did not train.")
-        return
-
-    # Re-train on all data
-    from findgood.features import compute_features
     all_training = []
-    trading_days_list = []
-    with db.get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT DISTINCT trade_date FROM day_aggs
-                WHERE trade_date >= %s AND trade_date <= %s
-                ORDER BY trade_date
-            """, (earliest, latest))
-            trading_days_list = [row[0] for row in cur.fetchall()]
-
-    # Use last 120 trading days for training (faster than full history)
-    train_dates = trading_days_list[-120:]
-    print(f"Training on last {len(train_dates)} trading days...")
-    for td in train_dates:
+    for i, td in enumerate(train_dates, 1):
+        if i % 20 == 0:
+            print(f"  [{i}/{len(train_dates)}]", flush=True)
         feats = compute_features(td, min_price, min_volume)
         if feats:
             for f in feats:
@@ -338,7 +330,23 @@ def predict(strategy, top_n, min_price, min_volume):
                 f["alpha_return"] = float(f["intraday_return"]) - beta * float(f.get("spy_return_1d", 0))
             all_training.append((feats, None))
 
+    if not all_training:
+        print("No training data available.")
+        return
+
     model, scaler = train_fn(all_training, target_key)
+    print(f"  Model trained on {sum(len(t[0]) for t in all_training):,} stock-days.", flush=True)
+    print()
+
+    # Step 4: Score forward-looking features
+    print("Step 4: Scoring stocks for next trading day...", flush=True)
+    features = compute_features_forward(min_price, min_volume)
+    if not features:
+        print("No eligible stocks found.")
+        return
+
+    X = _features_to_df(features)
+    mask = X.notna().all(axis=1) & np.isfinite(X.values).all(axis=1)
 
     predictions = np.full(len(features), -999.0)
     if mask.any():
@@ -350,14 +358,21 @@ def predict(strategy, top_n, min_price, min_volume):
 
     scored = sorted(features, key=lambda r: r["score"], reverse=True)
 
-    print(f"\nData through: {latest}")
-    print(f"Buy at next market open, sell at close.")
-    print(f"Strategy: {strategy} | Min price ${min_price} | Min volume {min_volume:,.0f}")
-    print(f"\nTop {top_n} picks:")
+    # Output
+    print(f"\n{'='*45}")
+    print(f"  FINDGOOD — Picks for next trading day")
+    print(f"{'='*45}")
+    print(f"  Data through:  {latest}")
+    print(f"  Strategy:      {strategy}")
+    print(f"  Filters:       price >= ${min_price}, avg vol >= {min_volume:,.0f}")
+    print(f"  Eligible:      {len(features):,} stocks")
+    print(f"{'='*45}")
+    print(f"\n  Buy at market open, sell at market close.\n")
     print(f"{'Rank':>4} {'Symbol':>8} {'Score':>10} {'Prev Close':>11}")
     print("-" * 37)
     for i, f in enumerate(scored[:top_n], 1):
         print(f"{i:>4} {f['symbol']:>8} {f['score']:>+10.6f} ${float(f.get('prev_close', 0)):>9.2f}")
+    print()
 
 
 if __name__ == "__main__":
