@@ -7,6 +7,7 @@ findgood/db.py
 findgood/downloader.py
 findgood/features.py
 findgood/ingest.py
+findgood/longterm.py
 findgood/news.py
 findgood/sectors.py
 findgood.egg-info/PKG-INFO

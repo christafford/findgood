@@ -375,5 +375,62 @@ def predict(strategy, top_n, min_price, min_volume, skip_download):
     print()
 
 
+@cli.command("buy-and-hold")
+@click.option("--top-n", "-n", default=10, help="Number of stocks to pick.")
+@click.option("--min-price", default=10.0, help="Minimum stock price filter.")
+@click.option("--min-volume", default=500_000.0, help="Minimum 30-day avg volume filter.")
+def buy_and_hold(top_n, min_price, min_volume):
+    """Predict the best stocks to buy and hold for one year."""
+    from findgood.longterm import train_and_predict
+
+    print("FindGood — 1-Year Buy & Hold Predictions")
+    print("=" * 50)
+    print(f"Filters: price >= ${min_price}, avg vol >= {min_volume:,.0f}")
+    print(f"Training on monthly samples with known 1yr forward returns...")
+    print()
+
+    result = train_and_predict(min_price, min_volume, top_n)
+
+    if "error" in result:
+        print(f"Error: {result['error']}")
+        return
+
+    print(f"\nFeature importance:")
+    for feat, coef in result["feature_importance"]:
+        direction = "+" if coef > 0 else "-"
+        bar = direction * int(min(abs(coef) * 20, 30))
+        print(f"  {feat:<30} {coef:>+8.4f}  {bar}")
+
+    print(f"\n{'=' * 60}")
+    print(f"  TOP {top_n} BUY & HOLD PICKS")
+    print(f"  As of: {result['as_of_date']}")
+    print(f"  Trained on: {result['training_samples']:,} stock-month samples")
+    print(f"  Avg 1yr return in training data: {result['avg_training_return']:+.1%}")
+    print(f"  Eligible stocks scored: {result['eligible_stocks']:,}")
+    print(f"{'=' * 60}")
+    print()
+    print(f"{'Rank':>4} {'Symbol':>8} {'Predicted 1yr':>14} {'Price':>8} {'Sector':>20}")
+    print("-" * 58)
+
+    conn = db.get_connection()
+    try:
+        with conn.cursor() as cur:
+            for i, f in enumerate(result["picks"], 1):
+                # Get sector for display
+                cur.execute("""
+                    SELECT td.sector FROM ticker_details td
+                    WHERE td.ticker_id = %s
+                """, (f["ticker_id"],))
+                sector_row = cur.fetchone()
+                sector = sector_row[0] if sector_row and sector_row[0] else "—"
+
+                print(f"{i:>4} {f['symbol']:>8} {f['predicted_1yr_return']:>+13.1%}"
+                      f" ${float(f['close_price']):>7.2f} {sector:>20}")
+    finally:
+        conn.close()
+
+    print()
+
+
 if __name__ == "__main__":
     cli()
