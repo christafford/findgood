@@ -472,5 +472,50 @@ def buy_and_hold_backtest(top_n, min_price, min_volume):
     print()
 
 
+@cli.command("weekly-backtest")
+@click.option("--top-n", "-n", default=5, help="Number of stocks to pick per week.")
+@click.option("--min-price", default=10.0, help="Minimum stock price filter.")
+@click.option("--min-volume", default=500_000.0, help="Minimum 20-day avg volume filter.")
+def weekly_backtest(top_n, min_price, min_volume):
+    """Backtest weekly strategy: buy Monday open, sell Friday close, vs S&P 500."""
+    from findgood.weekly import backtest_weekly
+
+    print("FindGood — Weekly Buy & Hold Backtest vs S&P 500")
+    print("=" * 55)
+    print(f"Pick top {top_n} stocks each week, hold Mon-Fri")
+    print(f"Filters: price >= ${min_price}, avg vol >= {min_volume:,.0f}")
+    print()
+
+    result = backtest_weekly(min_price, min_volume, top_n)
+
+    if "error" in result:
+        print(f"Error: {result['error']}")
+        return
+
+    print()
+    print(f"{'=' * 55}")
+    print(f"  RESULTS: {result['weeks_tested']} weeks tested")
+    print(f"  Period: {result['period']}")
+    print(f"{'=' * 55}")
+    print()
+    print(f"  Avg weekly return:       {result['avg_weekly_return']:>+7.2%}")
+    print(f"  Avg SPY weekly return:   {result['avg_spy_weekly_return']:>+7.2%}")
+    print(f"  Avg weekly alpha:        {result['avg_weekly_alpha']:>+7.2%}")
+    print()
+    print(f"  Cumulative return:       {result['cumulative_return']:>+7.1%}")
+    print(f"  Cumulative SPY return:   {result['cumulative_spy_return']:>+7.1%}")
+    print(f"  Cumulative alpha:        {result['cumulative_alpha']:>+7.1%}")
+    print()
+    print(f"  Beat SPY:  {result['beat_spy_count']}/{result['weeks_tested']} "
+          f"({result['beat_spy_rate']:.0%})")
+
+    if result.get("feature_importance"):
+        print(f"\n  Feature importance:")
+        for feat, coef in result["feature_importance"][:10]:
+            print(f"    {feat:<30} {coef:>+8.5f}")
+
+    print()
+
+
 if __name__ == "__main__":
     cli()

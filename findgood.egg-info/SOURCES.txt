@@ -10,6 +10,7 @@ findgood/ingest.py
 findgood/longterm.py
 findgood/news.py
 findgood/sectors.py
+findgood/weekly.py
 findgood.egg-info/PKG-INFO
 findgood.egg-info/SOURCES.txt
 findgood.egg-info/dependency_links.txt
