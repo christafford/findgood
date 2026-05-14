@@ -59,23 +59,34 @@ def _get_training_dates(conn) -> list[date]:
         return [row[0] for row in cur.fetchall()]
 
 
-def _get_forward_return(ticker_id: int, from_date: date, conn) -> float | None:
-    """Get the 1-year (252 trading day) forward return for a ticker."""
+def _get_forward_returns_bulk(as_of_date: date, conn) -> dict[int, float]:
+    """Get 1-year forward close price for all tickers as of a date.
+
+    Finds the trading day closest to 252 trading days later and returns
+    a dict of ticker_id -> forward_close_price.
+    """
     with conn.cursor() as cur:
+        # Find the trading date ~252 days forward
         cur.execute("""
-            WITH future AS (
-                SELECT close, ROW_NUMBER() OVER (ORDER BY trade_date) AS rn
-                FROM day_aggs
-                WHERE ticker_id = %s AND trade_date > %s
+            SELECT trade_date FROM (
+                SELECT DISTINCT trade_date FROM day_aggs
+                WHERE trade_date > %s
                 ORDER BY trade_date
                 LIMIT 252
-            )
-            SELECT close FROM future WHERE rn = 252
-        """, (ticker_id, from_date))
+            ) sub
+            ORDER BY trade_date DESC
+            LIMIT 1
+        """, (as_of_date,))
         row = cur.fetchone()
         if not row:
-            return None
-        return row[0]
+            return {}
+        target_date = row[0]
+
+        cur.execute("""
+            SELECT ticker_id, close FROM day_aggs
+            WHERE trade_date = %s AND close > 0
+        """, (target_date,))
+        return {r[0]: float(r[1]) for r in cur.fetchall()}
 
 
 def train_and_predict(min_price: float = 10.0, min_avg_volume: float = 500_000,
@@ -104,18 +115,27 @@ def train_and_predict(min_price: float = 10.0, min_avg_volume: float = 500_000,
 
         features = _compute_longterm_features(td, min_price, min_avg_volume)
         if not features:
+            skipped += 1
             continue
 
-        # Get 1-year forward return for each stock
+        # Bulk fetch forward prices
+        forward_prices = _get_forward_returns_bulk(td, conn)
+
+        matched = 0
         for f in features:
-            future_close = _get_forward_return(f["ticker_id"], td, conn)
-            if future_close is not None and float(f.get("close_price", 0)) > 0:
-                fwd_return = (float(future_close) - float(f["close_price"])) / float(f["close_price"])
+            tid = f["ticker_id"]
+            close_now = float(f.get("close_price", 0))
+            future_close = forward_prices.get(tid)
+            if future_close is not None and close_now > 0:
+                fwd_return = (future_close - close_now) / close_now
                 X_row = {col: float(f.get(col, 0)) for col in FEATURE_COLUMNS}
                 all_X.append(X_row)
                 all_y.append(fwd_return)
-            else:
-                skipped += 1
+                matched += 1
+
+        if i == 0:
+            print(f"      {len(features)} stocks scored, {matched} with forward data, "
+                  f"{len(forward_prices)} forward prices found", flush=True)
 
     conn.close()
 
