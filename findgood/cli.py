@@ -432,5 +432,45 @@ def buy_and_hold(top_n, min_price, min_volume):
     print()
 
 
+@cli.command("buy-and-hold-backtest")
+@click.option("--top-n", "-n", default=10, help="Number of stocks to pick per quarter.")
+@click.option("--min-price", default=10.0, help="Minimum stock price filter.")
+@click.option("--min-volume", default=500_000.0, help="Minimum 30-day avg volume filter.")
+def buy_and_hold_backtest(top_n, min_price, min_volume):
+    """Backtest buy-and-hold strategy vs S&P 500 (quarterly, 1yr holding)."""
+    from findgood.longterm import backtest_vs_spy
+
+    print("FindGood — Buy & Hold Backtest vs S&P 500")
+    print("=" * 55)
+    print(f"Pick top {top_n} stocks each quarter, hold for 1 year")
+    print(f"Filters: price >= ${min_price}, avg vol >= {min_volume:,.0f}")
+    print()
+
+    result = backtest_vs_spy(min_price, min_volume, top_n)
+
+    if "error" in result:
+        print(f"Error: {result['error']}")
+        return
+
+    print()
+    print(f"{'=' * 55}")
+    print(f"  RESULTS: {result['quarters_tested']} quarters tested")
+    print(f"  Period: {result['period']}")
+    print(f"{'=' * 55}")
+    print()
+    print(f"  Avg portfolio 1yr return:  {result['avg_pick_1yr_return']:>+7.1%}")
+    print(f"  Avg S&P 500 1yr return:    {result['avg_spy_1yr_return']:>+7.1%}")
+    print(f"  Avg alpha (vs SPY):        {result['avg_alpha']:>+7.1%}")
+    print(f"  Beat SPY:                  {result['beat_spy_count']}/{result['quarters_tested']} "
+          f"({result['beat_spy_rate']:.0%})")
+    print()
+
+    print(f"{'Quarter':<12} {'Portfolio':>10} {'S&P 500':>10} {'Alpha':>10}")
+    print("-" * 45)
+    for r in result["quarterly_results"]:
+        print(f"{r['date']}  {r['avg_pick_return']:>+9.1%}  {r['spy_return']:>+9.1%}  {r['alpha']:>+9.1%}")
+    print()
+
+
 if __name__ == "__main__":
     cli()

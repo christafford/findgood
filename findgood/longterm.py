@@ -219,6 +219,195 @@ def _is_leveraged(symbol: str) -> bool:
     return symbol in leveraged_prefixes
 
 
+def backtest_vs_spy(min_price: float = 10.0, min_avg_volume: float = 500_000,
+                    top_n: int = 10) -> dict:
+    """Walk-forward backtest: quarterly, train on prior data, pick top N,
+    measure actual 1yr return vs SPY's 1yr return from same date."""
+    conn = get_connection()
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT MIN(trade_date), MAX(trade_date) FROM day_aggs")
+        earliest, latest = cur.fetchone()
+
+        # Get quarterly test dates: first trading day of each quarter
+        # Must have 252+ days of prior data for training AND 252 days forward for evaluation
+        cur.execute("""
+            SELECT DISTINCT ON (date_trunc('quarter', trade_date))
+                   trade_date
+            FROM day_aggs
+            WHERE trade_date >= %s + 365
+              AND trade_date <= %s - 252
+            ORDER BY date_trunc('quarter', trade_date), trade_date
+        """, (earliest, latest))
+        test_dates = [row[0] for row in cur.fetchall()]
+
+        # Get SPY ticker_id
+        cur.execute("SELECT id FROM tickers WHERE symbol = 'SPY'")
+        spy_id = cur.fetchone()[0]
+
+    print(f"  Test dates: {len(test_dates)} quarters "
+          f"({test_dates[0]} to {test_dates[-1]})", flush=True)
+
+    results = []
+
+    for qi, test_date in enumerate(test_dates):
+        print(f"  [{qi+1}/{len(test_dates)}] {test_date} ... ", end="", flush=True)
+
+        # Get training dates: monthly samples BEFORE test_date with 1yr forward visible
+        conn2 = get_connection()
+        with conn2.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT ON (date_trunc('month', trade_date))
+                       trade_date
+                FROM day_aggs
+                WHERE trade_date < %s
+                  AND trade_date <= %s - 252
+                ORDER BY date_trunc('month', trade_date), trade_date
+            """, (test_date, test_date))
+            train_dates = [row[0] for row in cur.fetchall()]
+        conn2.close()
+
+        if len(train_dates) < 6:
+            print("not enough training data, skipping")
+            continue
+
+        # Build training data
+        all_X = []
+        all_y = []
+        conn2 = get_connection()
+        for td in train_dates:
+            features = _compute_longterm_features(td, min_price, min_avg_volume)
+            if not features:
+                continue
+            forward_prices = _get_forward_returns_bulk(td, conn2)
+            for f in features:
+                tid = f["ticker_id"]
+                close_now = float(f.get("close_price", 0))
+                future_close = forward_prices.get(tid)
+                if future_close is not None and close_now > 0:
+                    fwd_return = (future_close - close_now) / close_now
+                    all_X.append({col: float(f.get(col, 0)) for col in FEATURE_COLUMNS})
+                    all_y.append(fwd_return)
+        conn2.close()
+
+        if not all_X:
+            print("no training data")
+            continue
+
+        X = pd.DataFrame(all_X)
+        y = np.array(all_y)
+        mask = X.notna().all(axis=1) & np.isfinite(X.values).all(axis=1) & np.isfinite(y)
+        X, y = X[mask], y[mask]
+
+        if len(X) < 100:
+            print(f"only {len(X)} samples, skipping")
+            continue
+
+        # Train
+        scaler = StandardScaler()
+        model = Ridge(alpha=10.0)
+        model.fit(scaler.fit_transform(X), y)
+
+        # Score stocks on test_date
+        features = _compute_longterm_features(test_date, min_price, min_avg_volume)
+        if not features:
+            print("no eligible stocks")
+            continue
+
+        X_test = pd.DataFrame([
+            {col: float(f.get(col, 0)) for col in FEATURE_COLUMNS}
+            for f in features
+        ])
+        test_mask = X_test.notna().all(axis=1) & np.isfinite(X_test.values).all(axis=1)
+
+        predictions = np.full(len(features), -999.0)
+        if test_mask.any():
+            predictions[test_mask.values] = model.predict(scaler.transform(X_test[test_mask]))
+
+        for j, f in enumerate(features):
+            f["predicted"] = float(predictions[j])
+
+        # Pick top N (exclude leveraged)
+        candidates = [f for f in features if f["predicted"] > -999.0
+                      and not _is_leveraged(f["symbol"])]
+        candidates.sort(key=lambda f: f["predicted"], reverse=True)
+        picks = candidates[:top_n]
+
+        if not picks:
+            print("no valid picks")
+            continue
+
+        # Get actual 1yr forward returns for picks and SPY
+        conn2 = get_connection()
+        forward_prices = _get_forward_returns_bulk(test_date, conn2)
+        conn2.close()
+
+        pick_returns = []
+        for p in picks:
+            close_now = float(p["close_price"])
+            future_close = forward_prices.get(p["ticker_id"])
+            if future_close and close_now > 0:
+                pick_returns.append((p["symbol"], (future_close - close_now) / close_now))
+
+        if not pick_returns:
+            print("no forward data for picks")
+            continue
+
+        avg_pick_return = np.mean([r for _, r in pick_returns])
+
+        # SPY return
+        spy_now = None
+        spy_future = None
+        conn2 = get_connection()
+        with conn2.cursor() as cur:
+            cur.execute("SELECT close FROM day_aggs WHERE ticker_id = %s AND trade_date = %s",
+                        (spy_id, test_date))
+            row = cur.fetchone()
+            if row:
+                spy_now = float(row[0])
+            spy_future_close = forward_prices.get(spy_id)
+        conn2.close()
+
+        spy_return = ((spy_future_close - spy_now) / spy_now) if (spy_now and spy_future_close) else 0
+
+        alpha = avg_pick_return - spy_return
+
+        symbols = ", ".join(s for s, _ in pick_returns[:5])
+        if len(pick_returns) > 5:
+            symbols += f" +{len(pick_returns)-5} more"
+        print(f"picks={avg_pick_return:+.1%} SPY={spy_return:+.1%} alpha={alpha:+.1%}  [{symbols}]")
+
+        results.append({
+            "date": test_date,
+            "picks": pick_returns,
+            "avg_pick_return": avg_pick_return,
+            "spy_return": spy_return,
+            "alpha": alpha,
+            "training_samples": len(X),
+        })
+
+    conn.close()
+
+    if not results:
+        return {"error": "No testable quarters"}
+
+    avg_pick = np.mean([r["avg_pick_return"] for r in results])
+    avg_spy = np.mean([r["spy_return"] for r in results])
+    avg_alpha = np.mean([r["alpha"] for r in results])
+    win_count = sum(1 for r in results if r["alpha"] > 0)
+
+    return {
+        "quarters_tested": len(results),
+        "period": f"{results[0]['date']} to {results[-1]['date']}",
+        "avg_pick_1yr_return": avg_pick,
+        "avg_spy_1yr_return": avg_spy,
+        "avg_alpha": avg_alpha,
+        "beat_spy_count": win_count,
+        "beat_spy_rate": win_count / len(results),
+        "quarterly_results": results,
+    }
+
+
 LONGTERM_FEATURE_QUERY = """
 WITH target_date AS (
     SELECT %(as_of_date)s::date AS dt
@@ -415,7 +604,7 @@ WHERE st.close_price >= %(min_price)s
   AND COALESCE(ss.avg_volume_30d, 0) >= %(min_avg_volume)s
   AND ss.trading_days_available >= 200
   -- Exclude ETFs and leveraged products by requiring ticker_details entry
-  AND EXISTS (SELECT 1 FROM ticker_details td WHERE td.ticker_id = st.ticker_id AND td.sector IS NOT NULL)
+  -- Include stocks with or without sector data (sector features will be 0 if missing)
 
 ORDER BY st.ticker_id
 """
