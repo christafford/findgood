@@ -255,49 +255,43 @@ def compare(min_price, min_volume):
 
 
 @cli.command("predict")
-@click.option("--strategy", "-s",
-              type=click.Choice(list(STRATEGIES.keys()), case_sensitive=False),
-              default="ridge_alpha",
-              help="Strategy to use for prediction.")
 @click.option("--top-n", "-n", default=3, help="Number of stocks to pick.")
 @click.option("--min-price", default=10.0, help="Minimum stock price filter.")
 @click.option("--min-volume", default=1_000_000.0, help="Minimum 10-day avg volume filter.")
+@click.option("--capital", "-c", default=10_000.0, help="Total capital to allocate ($).")
 @click.option("--skip-download", is_flag=True, help="Skip downloading new data.")
-def predict(strategy, top_n, min_price, min_volume, skip_download):
+def predict(top_n, min_price, min_volume, capital, skip_download):
     """Download latest data and generate picks for next trading day.
 
     Run this each morning before market open. It will:
     1. Download any new day_aggs and news data
     2. Update the eod_cache
-    3. Train the model on recent data
-    4. Output top picks for today
+    3. Train ridge_alpha on recent data
+    4. Output top picks with position sizing
     """
     import numpy as np
     from findgood.features import compute_features, compute_features_forward
-    from findgood.backtest import _train_ridge, _train_lgbm, _features_to_df
-    from findgood.sectors import fetch_ticker_details, init_sector_etfs
+    from findgood.backtest import _train_ridge, _features_to_df
 
     # Step 1: Download latest data
     if not skip_download:
-        print("Step 1: Downloading latest data...", flush=True)
+        print("[1/4] Downloading latest data...", flush=True)
         ingest_data_type("day_aggs", "day_aggs_v1")
         fetch_news()
-        # Fetch sector info for any new tickers
-        init_sector_etfs()
-        fetch_ticker_details()
         print()
+    else:
+        print("[1/4] Skipping download.", flush=True)
 
     # Step 2: Update eod_cache
-    print("Step 2: Updating eod_cache...", flush=True)
+    print("[2/4] Updating eod_cache...", flush=True)
     build_eod_cache_v2()
-    print()
 
-    # Step 3: Get date range
+    # Step 3: Train model
     conn = db.get_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT MIN(trade_date), MAX(trade_date) FROM day_aggs")
-            earliest, latest = cur.fetchone()
+            cur.execute("SELECT MAX(trade_date) FROM day_aggs")
+            latest = cur.fetchone()[0]
             cur.execute("""
                 SELECT DISTINCT trade_date FROM day_aggs
                 ORDER BY trade_date DESC LIMIT 120
@@ -306,23 +300,17 @@ def predict(strategy, top_n, min_price, min_volume, skip_download):
     finally:
         conn.close()
 
-    if not earliest:
-        print("No data available.")
+    if not latest:
+        print("No data available. Run 'findgood download' first.")
         return
 
-    # Step 3: Train model on last 120 trading days
-    model_type = STRATEGIES.get(strategy)
-    is_alpha = strategy.endswith("_alpha")
-    target_key = "alpha_return" if is_alpha else "intraday_return"
-    train_fn = _train_lgbm if model_type == "lgbm" else _train_ridge
-
-    print(f"Step 3: Training {strategy} on {len(train_dates)} trading days "
+    print(f"[3/4] Training ridge_alpha on {len(train_dates)} days "
           f"({train_dates[0]} to {train_dates[-1]})...", flush=True)
 
     all_training = []
     for i, td in enumerate(train_dates, 1):
-        if i % 20 == 0:
-            print(f"  [{i}/{len(train_dates)}]", flush=True)
+        if i % 30 == 0:
+            print(f"      [{i}/{len(train_dates)}]", flush=True)
         feats = compute_features(td, min_price, min_volume)
         if feats:
             for f in feats:
@@ -334,44 +322,91 @@ def predict(strategy, top_n, min_price, min_volume, skip_download):
         print("No training data available.")
         return
 
-    model, scaler = train_fn(all_training, target_key)
-    print(f"  Model trained on {sum(len(t[0]) for t in all_training):,} stock-days.", flush=True)
-    print()
+    model, scaler = _train_ridge(all_training, "alpha_return")
+    total_samples = sum(len(t[0]) for t in all_training)
+    print(f"      Trained on {total_samples:,} stock-days.", flush=True)
 
     # Step 4: Score forward-looking features
-    print("Step 4: Scoring stocks for next trading day...", flush=True)
+    print(f"[4/4] Scoring stocks...", flush=True)
     features = compute_features_forward(min_price, min_volume)
     if not features:
         print("No eligible stocks found.")
         return
+
+    # Filter out ETFs and leveraged products — only common stock
+    conn = db.get_connection()
+    try:
+        with conn.cursor() as cur:
+            # Get ticker types from the tickers that have details
+            ticker_ids = [f["ticker_id"] for f in features]
+            cur.execute("""
+                SELECT td.ticker_id, td.sector, td.industry
+                FROM ticker_details td
+                WHERE td.ticker_id = ANY(%s)
+            """, (ticker_ids,))
+            details = {row[0]: (row[1], row[2]) for row in cur.fetchall()}
+    finally:
+        conn.close()
+
+    # Attach sector info and filter
+    for f in features:
+        tid = f["ticker_id"]
+        if tid in details:
+            f["sector"] = details[tid][0] or "—"
+            f["industry"] = details[tid][1] or "—"
+        else:
+            f["sector"] = "—"
+            f["industry"] = "—"
 
     X = _features_to_df(features)
     mask = X.notna().all(axis=1) & np.isfinite(X.values).all(axis=1)
 
     predictions = np.full(len(features), -999.0)
     if mask.any():
-        X_pred = scaler.transform(X[mask]) if scaler else X[mask]
-        predictions[mask.values] = model.predict(X_pred)
+        predictions[mask.values] = model.predict(scaler.transform(X[mask]))
 
     for j, f in enumerate(features):
         f["score"] = float(predictions[j])
 
-    scored = sorted(features, key=lambda r: r["score"], reverse=True)
+    # Filter: only common stocks (have sector or industry), exclude leveraged/inverse
+    from findgood.longterm import _is_leveraged
+    scored = [f for f in features
+              if f["score"] > -999.0
+              and not _is_leveraged(f["symbol"])
+              and f["sector"] != "—"]
+    scored.sort(key=lambda f: f["score"], reverse=True)
+
+    picks = scored[:top_n]
+    per_position = capital / top_n if top_n > 0 else 0
 
     # Output
-    print(f"\n{'='*45}")
-    print(f"  FINDGOOD — Picks for next trading day")
-    print(f"{'='*45}")
+    print(f"\n{'='*58}")
+    print(f"  FINDGOOD — Daily Picks")
+    print(f"{'='*58}")
     print(f"  Data through:  {latest}")
-    print(f"  Strategy:      {strategy}")
-    print(f"  Filters:       price >= ${min_price}, avg vol >= {min_volume:,.0f}")
-    print(f"  Eligible:      {len(features):,} stocks")
-    print(f"{'='*45}")
-    print(f"\n  Buy at market open, sell at market close.\n")
-    print(f"{'Rank':>4} {'Symbol':>8} {'Score':>10} {'Prev Close':>11}")
-    print("-" * 37)
-    for i, f in enumerate(scored[:top_n], 1):
-        print(f"{i:>4} {f['symbol']:>8} {f['score']:>+10.6f} ${float(f.get('prev_close', 0)):>9.2f}")
+    print(f"  Model:         ridge_alpha (120-day training window)")
+    print(f"  Universe:      {len(scored):,} stocks "
+          f"(price >= ${min_price}, vol >= {min_volume:,.0f})")
+    print(f"{'='*58}")
+    print(f"\n  Action: Buy at market open, sell at market close.")
+    print(f"  Capital: ${capital:,.2f} | ${per_position:,.2f} per position\n")
+
+    print(f"{'Rank':>4} {'Symbol':>7} {'Score':>9} {'Close':>8} "
+          f"{'Shares':>7} {'Sector'}")
+    print("-" * 62)
+    for i, f in enumerate(picks, 1):
+        price = float(f.get("prev_close", 0))
+        shares = int(per_position / price) if price > 0 else 0
+        cost = shares * price
+        print(f"{i:>4} {f['symbol']:>7} {f['score']:>+9.5f} ${price:>7.2f} "
+              f"{shares:>7} {f['sector']}")
+
+    if picks:
+        total_cost = sum(
+            int(per_position / float(p.get("prev_close", 1))) * float(p.get("prev_close", 1))
+            for p in picks
+        )
+        print(f"\n  Total invested: ${total_cost:,.2f} of ${capital:,.2f}")
     print()
 
 
